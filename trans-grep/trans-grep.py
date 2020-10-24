@@ -4,6 +4,7 @@ import click
 import json
 from intervaltree import IntervalTree
 import math
+import regex
 
 class CandidateTranscription:
     def __init__(self, transcription_items):
@@ -98,6 +99,16 @@ class CandidateTranscription:
 
         return (self.find_timestamp(match_start_index), self.find_timestamp(match_end_index))
 
+    def regex_findall(self, query):
+        return [
+            (
+                self.find_timestamp(match.start()),
+                self.find_timestamp(match.end())
+            )
+            for match
+            in regex.finditer(query, self.transcript_string, flags=regex.IGNORECASE | regex.BESTMATCH)
+        ]
+
     # Look up an index in the transcript string and turn it into an audio time-stamp
     def find_timestamp(self, transcript_character_index):
         # If this is the last character in the tree
@@ -144,7 +155,10 @@ def grep(query, input, simple, padding):
         results.append(result)
 
     else:
-        pass
+        for result in maximum_liklihood_transcription.regex_findall(query):
+            results.append(result)
+
+    click.echo(click.style("{} matches found!".format(len(results)), fg='green'), err=True)
 
     padded_results = [pad_result(s, padding) for s in results]
 
