@@ -100,11 +100,17 @@ class CandidateTranscription:
 
     # Look up an index in the transcript string and turn it into an audio time-stamp
     def find_timestamp(self, transcript_character_index):
-        # Lookup the matching interval
-        interval = self.tree[transcript_character_index].pop()
+        # If this is the last character in the tree
+        if transcript_character_index >= self.tree.end():
+            # Special case handling: pick the last interval and interpolate to the end
+            interval = self.tree[self.tree.end() - 1].pop()
+            interpolation_fraction = 1.0
+        else:
+            # Lookup the matching interval
+            interval = self.tree[transcript_character_index].pop()
 
-        # Work out how far through this chunk the index is
-        interpolation_fraction = float(transcript_character_index - interval.begin) / float(interval.end - interval.begin)
+            # Work out how far through this chunk the index is
+            interpolation_fraction = float(transcript_character_index - interval.begin) / float(interval.end - interval.begin)
 
         # Turn that fraction into a timestamp
         return interval.data['start_time'] + (interpolation_fraction * (interval.data['end_time'] - interval.data['start_time']))
