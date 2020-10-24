@@ -170,7 +170,8 @@ class CandidateTranscription:
 @click.option('--simple', '-s', default=False, is_flag=True)
 @click.option('--padding', '-p', type=float, default=0.05, help="Padding in seconds to apply around match timestamps")
 @click.option('--context', '-c', type=int, default=0, help="Number of words to show either side of the match")
-def grep(query, input, simple, padding, context):
+@click.option('--format', '-f', type=click.Choice(['text', 'json'], case_sensitive=False), default="text")
+def grep(query, input, simple, padding, context, format):
     transcription_data = json.loads(input.read())
 
     # The items field contains the maximum likelihood transcription value
@@ -194,26 +195,41 @@ def grep(query, input, simple, padding, context):
 
     padded_results = [s.pad(padding) for s in results]
 
-    # Render the heading row
-    click.echo(
-        "\t".join([
-            click.style(heading, underline=True, dim=True)
-            for heading
-            in ("Start", "End", "Text")
-        ]),
-        err=True
-    )
+    if format == 'text':
+        # Render the heading row
+        click.echo(
+            "\t".join([
+                click.style(heading, underline=True, dim=True)
+                for heading
+                in ("Start", "End", "Text")
+            ]),
+            err=True
+        )
 
     # And then the actual matches, line-by-line
     for result in padded_results:
         before_context, text, after_context = result.text_with_context(context)
-        print("{:.2f}\t{:.2f}\t{}{}{}".format(
-            result.time_slice.start_time,
-            result.time_slice.end_time,
-            before_context,
-            click.style(text, fg="red", bold=True),
-            after_context
-        ))
+
+        if format == 'text':
+            click.echo("{:.2f}\t{:.2f}\t{}{}{}".format(
+                result.time_slice.start_time,
+                result.time_slice.end_time,
+                before_context,
+                click.style(text, fg="red", bold=True),
+                after_context
+            ))
+        elif format == 'json':
+            click.echo(json.dumps({
+                "start_time": result.time_slice.start_time,
+                "end_time": result.time_slice.end_time,
+                "match": text,
+                "context": {
+                    "before": before_context,
+                    "after": after_context,
+                }
+            }))
+        else:
+            raise "Unknown format: {}".format(format)
 
 if __name__ == '__main__':
     grep()
