@@ -7,7 +7,45 @@ import math
 import regex
 import collections
 
-SearchResult = collections.namedtuple("SearchResult", ["start_time", "end_time", "text"])
+TextSlice = collections.namedtuple("TextSlice", ["start_index", "end_index"])
+TimeSlice = collections.namedtuple("TimeSlice", ["start_time", "end_time"])
+
+class SearchResult:
+    def __init__(self, parent_transcript, text_slice, override_time_slice=None):
+        self.parent_transcript = parent_transcript
+        self.text_slice = text_slice
+
+        if override_time_slice is None:
+            self.time_slice = TimeSlice(
+                self.parent_transcript.find_timestamp(self.text_slice.start_index),
+                self.parent_transcript.find_timestamp(self.text_slice.end_index),
+            )
+        else:
+            self.time_slice = override_time_slice
+
+        # The whole match string
+        self.text = self.parent_transcript.transcript_string[self.text_slice.start_index:self.text_slice.end_index]
+
+    def pad(self, time_padding_seconds):
+        return SearchResult(
+            self.parent_transcript,
+            self.text_slice,
+            TimeSlice(
+                max(0.0, self.time_slice.start_time - time_padding_seconds),
+                self.time_slice.end_time + time_padding_seconds,
+            )
+        )
+
+    def text_with_context(self, context_word_count):
+        if context_word_count <= 0:
+            return ("", self.text, "")
+
+        # Take the first n words from before and after the match in the transcript
+        before_context = " ".join(self.parent_transcript.transcript_string[:self.text_slice.start_index].split()[-context_word_count:])
+        after_context = " ".join(self.parent_transcript.transcript_string[self.text_slice.end_index:].split()[:context_word_count])
+
+        # Return them all as a tuple (with padding so that they can all just be concated together)
+        return (before_context + " ", self.text, " " + after_context)
 
 class CandidateTranscription:
     def __init__(self, transcription_items):
@@ -100,19 +138,11 @@ class CandidateTranscription:
 
         match_end_index = match_start_index + len(normalised_query)
 
-        return SearchResult(
-            self.find_timestamp(match_start_index),
-            self.find_timestamp(match_end_index),
-            self.transcript_string.slice(match_start_index, match_end_index)
-        )
+        return SearchResult(self, TextSlice(match_start_index, match_end_index))
 
     def regex_findall(self, query):
         return [
-            SearchResult(
-                self.find_timestamp(match.start()),
-                self.find_timestamp(match.end()),
-                match.group(0) # The whole match
-            )
+            SearchResult(self, TextSlice(match.start(), match.end()))
             for match
             in regex.finditer(query, self.transcript_string, flags=regex.IGNORECASE | regex.BESTMATCH)
         ]
@@ -134,20 +164,13 @@ class CandidateTranscription:
         # Turn that fraction into a timestamp
         return interval.data['start_time'] + (interpolation_fraction * (interval.data['end_time'] - interval.data['start_time']))
 
-def pad_result(search_result, padding):
-    return SearchResult(
-        search_result.start_time - padding,
-        search_result.end_time + padding,
-        search_result.text
-    )
-
-
 @click.command()
 @click.argument('query')
 @click.argument('input', type=click.File('r'))
 @click.option('--simple', '-s', default=False, is_flag=True)
-@click.option('--padding', '-p', type=float, default=0.05)
-def grep(query, input, simple, padding):
+@click.option('--padding', '-p', type=float, default=0.05, help="Padding in seconds to apply around match timestamps")
+@click.option('--context', '-c', type=int, default=0, help="Number of words to show either side of the match")
+def grep(query, input, simple, padding, context):
     transcription_data = json.loads(input.read())
 
     # The items field contains the maximum likelihood transcription value
@@ -169,11 +192,28 @@ def grep(query, input, simple, padding):
 
     click.echo(click.style("{} matches found!".format(len(results)), fg='green'), err=True)
 
-    padded_results = [pad_result(s, padding) for s in results]
+    padded_results = [s.pad(padding) for s in results]
 
-    click.echo(click.style("Start\tEnd\tText", bold=True), err=True)
+    # Render the heading row
+    click.echo(
+        "\t".join([
+            click.style(heading, underline=True, dim=True)
+            for heading
+            in ("Start", "End", "Text")
+        ]),
+        err=True
+    )
+
+    # And then the actual matches, line-by-line
     for result in padded_results:
-        print("{:.2f}\t{:.2f}\t{}".format(result.start_time, result.end_time, result.text))
+        before_context, text, after_context = result.text_with_context(context)
+        print("{:.2f}\t{:.2f}\t{}{}{}".format(
+            result.time_slice.start_time,
+            result.time_slice.end_time,
+            before_context,
+            click.style(text, fg="red", bold=True),
+            after_context
+        ))
 
 if __name__ == '__main__':
     grep()
