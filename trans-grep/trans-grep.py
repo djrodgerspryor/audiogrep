@@ -5,6 +5,9 @@ import json
 from intervaltree import IntervalTree
 import math
 import regex
+import collections
+
+SearchResult = collections.namedtuple("SearchResult", ["start_time", "end_time", "text"])
 
 class CandidateTranscription:
     def __init__(self, transcription_items):
@@ -97,13 +100,18 @@ class CandidateTranscription:
 
         match_end_index = match_start_index + len(normalised_query)
 
-        return (self.find_timestamp(match_start_index), self.find_timestamp(match_end_index))
+        return SearchResult(
+            self.find_timestamp(match_start_index),
+            self.find_timestamp(match_end_index),
+            self.transcript_string.slice(match_start_index, match_end_index)
+        )
 
     def regex_findall(self, query):
         return [
-            (
+            SearchResult(
                 self.find_timestamp(match.start()),
-                self.find_timestamp(match.end())
+                self.find_timestamp(match.end()),
+                match.group(0) # The whole match
             )
             for match
             in regex.finditer(query, self.transcript_string, flags=regex.IGNORECASE | regex.BESTMATCH)
@@ -126,10 +134,11 @@ class CandidateTranscription:
         # Turn that fraction into a timestamp
         return interval.data['start_time'] + (interpolation_fraction * (interval.data['end_time'] - interval.data['start_time']))
 
-def pad_result(time_slice, padding):
-    return (
-        time_slice[0] - padding,
-        time_slice[1] + padding
+def pad_result(search_result, padding):
+    return SearchResult(
+        search_result.start_time - padding,
+        search_result.end_time + padding,
+        search_result.text
     )
 
 
@@ -162,7 +171,9 @@ def grep(query, input, simple, padding):
 
     padded_results = [pad_result(s, padding) for s in results]
 
-    print(padded_results)
+    click.echo(click.style("Start\tEnd\tText", bold=True), err=True)
+    for result in padded_results:
+        print("{:.2f}\t{:.2f}\t{}".format(result.start_time, result.end_time, result.text))
 
 if __name__ == '__main__':
     grep()
