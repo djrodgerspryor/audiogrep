@@ -164,32 +164,69 @@ class CandidateTranscription:
         # Turn that fraction into a timestamp
         return interval.data['start_time'] + (interpolation_fraction * (interval.data['end_time'] - interval.data['start_time']))
 
-@click.command()
+@click.command(help="""
+        Search audio transcripts with a grep-like interface. Currently only supports transcripts in the format produced by AWS Transcribe.
+
+        QUERY — Search term. Regular expressions are supported (unless --mode is set to simple).
+        Punctuation is stripped from the transcript before matching, so do not include it
+        in your query. Fuzzy expressions are supported eg. (?:some text){e<3} will match the
+        phrase 'some text' with fewer than 3 edits. See https://pypi.org/project/regex/ for
+        full documentation of supported regex operations.
+
+        INPUT — A transcript file. Must be JSON formatted and structured like the output of the AWS Transcribe service
+    """
+)
 @click.argument('query')
 @click.argument('input', type=click.File('r'))
-@click.option('--simple', '-s', default=False, is_flag=True)
+@click.option(
+    '--mode',
+    '-m',
+    type=click.Choice(
+        ['re', 'regexp', 'regex', 'simple'],
+        case_sensitive=False
+    ),
+    default="regex",
+    help="""
+        Search mode. re regexp and regex are equivalent.
+        Simple mode just finds the first exact match (ignoring
+        punctuation). Both modes ignore case. regex is the default.
+    """
+)
 @click.option('--padding', '-p', type=float, default=0.05, help="Padding in seconds to apply around match timestamps")
 @click.option('--context', '-c', type=int, default=0, help="Number of words to show either side of the match")
-@click.option('--format', '-f', type=click.Choice(['text', 'json'], case_sensitive=False), default="text")
-def grep(query, input, simple, padding, context, format):
+@click.option(
+    '--format',
+    '-f',
+    type=click.Choice(
+        ['text', 'json'],
+        case_sensitive=False
+    ),
+    default="text",
+    help="Output format for stdout. Use json if you want to automatically parse the results."
+)
+def grep(query, input, mode, padding, context, format):
     transcription_data = json.loads(input.read())
 
     # The items field contains the maximum likelihood transcription value
     maximum_liklihood_transcription = CandidateTranscription(transcription_data['results']['items'])
 
     results = []
-    if simple:
+    if mode == 'simple':
         result = maximum_liklihood_transcription.simple_find(query)
 
-        if result is None:
-            click.echo(click.style("No match found", fg='red'), err=True)
-            exit(1)
+        if result is not None:
+            results.append(result)
 
-        results.append(result)
-
-    else:
+    elif mode in ['re', 'regexp', 'regex']:
         for result in maximum_liklihood_transcription.regex_findall(query):
             results.append(result)
+
+    else:
+        raise "Unknown mode: {}".format(mode)
+
+    if len(results) == 0:
+        click.echo(click.style("No match found", fg='red'), err=True)
+        exit(1)
 
     click.echo(click.style("{} matches found!".format(len(results)), fg='green'), err=True)
 
