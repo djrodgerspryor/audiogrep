@@ -1,5 +1,7 @@
 .DS_Store
 
+*.transcript.json
+
 data
 extract_mp3_urls.sh
 mp3_urls
