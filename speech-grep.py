@@ -13,10 +13,18 @@ import collections
 import json
 import time
 from urllib.parse import urlparse
+from concurrent.futures import ThreadPoolExecutor
+from tqdm import tqdm
+import math
+import signal
 
 TranscriptionConfig = collections.namedtuple("TranscriptionConfig", ["provider", "s3_bucket", "input_prefix", "output_prefix"])
 
 SAVED_CONFIG_LOCATION = os.path.expanduser('~/.speech-grep')
+
+# Enough to process big directories quickly, but without completely tying-up the 100 job limit
+# in AWS Transcribe
+MAX_PARALLEL_JOBS = 20
 
 SUPPORTED_FORMATS = set([
     'audio/mpeg',
@@ -50,7 +58,6 @@ def select_input_files(inputs, ignore_type):
     candidate_files = set()
     for input_item in set(inputs):
         if os.path.isdir(input_item):
-            print(input_item, "glob: {}".format(os.path.join(input_item, '**/*')))
             # Recursively search directories
             candidate_files.update(
                 [
@@ -142,8 +149,6 @@ def ensure_transcripts(input_files, transcription_options, transcription_config)
 
     to_transcode = [input_file for input_file in input_files if input_file not in transcript_path_by_input_path]
 
-    print(to_transcode)
-
     for input_file, transcript_file in zip(to_transcode, batch_transcribe(to_transcode, transcription_options, transcription_config)):
         transcript_path_by_input_path[input_file] = transcript_file
 
@@ -152,21 +157,65 @@ def ensure_transcripts(input_files, transcription_options, transcription_config)
 def batch_transcribe(input_files, transcription_options, transcription_config):
     click.echo("Preparing to transcribe {} files".format(len(input_files)), err=True)
 
-    # TODO: Parallel with parallel progress bars
-    results = []
-    for input_file in sorted(list(input_files)):
-        print(input_file)
-        results.append(
-            transcribe(input_file, transcription_options, transcription_config, upload_progress_callback=lambda x: None, transcribe_progress_callback=lambda x: None)
-        )
+    # Parallel
+    with ThreadPoolExecutor(max_workers=MAX_PARALLEL_JOBS) as pool:
+        sorted_input_files = sorted(list(input_files))
+
+        progress_description_width = 20
+        progress_bars_by_input_file = {}
+
+        try:
+            for i, input_file in enumerate(sorted_input_files):
+                progress_bars_by_input_file[input_file] = tqdm(
+                    position=i, # This creates different bars which won't overwrite each other
+                    leave=False, # Remove progress bars once they're all done
+                    total=100,
+                    unit="%",
+                    desc="Queued".rjust(progress_description_width, ' '),
+                    postfix=os.path.basename(input_file)
+                )
+
+            def update_progress(input_file, state, progress_fraction):
+                # Exit this thread if there's a global exit in progress. This is a convenient
+                # place for cooperative scheduling because it will be called by all threads
+                # frequently
+                if IS_EXITING:
+                    raise SystemExit
+
+                bar = progress_bars_by_input_file[input_file]
+                new_progress_value = max(0, min(100, math.floor(progress_fraction * 100.0)))
+                bar.update(new_progress_value - bar.n) # Pass in a diff value
+                bar.set_description(state.rjust(progress_description_width, ' '))
+
+            results = pool.map(
+                lambda input_file: transcribe(
+                    input_file,
+                    transcription_options,
+                    transcription_config,
+                    progress_callback=lambda state, progress: update_progress(input_file, state, progress)
+                ),
+                sorted_input_files
+            )
+
+            # Wait for execution to finish
+            results = list(results)
+
+        finally:
+            # Clean-up all progress bars once we're done
+            for bar in progress_bars_by_input_file.values():
+                bar.close()
+
+    return results
 
 
 class ExistingS3ObjectInvalid(Exception):
     pass
 
-def transcribe(input_file, transcription_options, transcription_config, upload_progress_callback=lambda x: None, transcribe_progress_callback=lambda x: None):
+def transcribe(input_file, transcription_options, transcription_config, progress_callback=lambda state, progress: None):
     aws_s3_client = boto3.client('s3')
     aws_transcribe_client = boto3.client('transcribe')
+
+    progress_callback("Checking S3", 0.00)
 
     file_size = os.path.getsize(input_file)
 
@@ -177,8 +226,6 @@ def transcribe(input_file, transcription_options, transcription_config, upload_p
     try:
         existing_object = aws_s3_client.head_object(Bucket=transcription_config.s3_bucket, Key=upload_key)
 
-        print("existing", file_size, existing_object['ContentLength'])
-
         # In addition to the content hash in the key, this should protect against reading the wrong
         # file (due to incomplete/partial uploads in the case of this check)
         if file_size != existing_object['ContentLength']:
@@ -186,18 +233,23 @@ def transcribe(input_file, transcription_options, transcription_config, upload_p
 
     # Object doesn't already exist
     except (ExistingS3ObjectInvalid, BotoClientError) as e:
-        print("Uploading...")
+        progress_callback("Uploading", 0.00)
+
+        uploaded_bytes_so_far = 0
+        def upload_progress_callback(chunk_size):
+            nonlocal uploaded_bytes_so_far
+            uploaded_bytes_so_far += chunk_size
+            progress_callback("Uploading", float(uploaded_bytes_so_far) / float(file_size))
 
         # Upload the source file
         aws_s3_client.upload_file(
             Filename=input_file,
             Bucket=transcription_config.s3_bucket,
             Key=upload_key,
-            Callback=lambda bytes: upload_progress_callback(float(bytes) / file_size)
+            Callback=upload_progress_callback
         )
-    else:
-        print("Adopting existing S3 object")
 
+    progress_callback("Preparing", 0.0)
 
     # Ensure that there is a transcription job for this file and query
     job_name = transcript_hash(input_file, transcription_options.digest())
@@ -244,41 +296,36 @@ def transcribe(input_file, transcription_options, transcription_config, upload_p
         else:
             job_kwargs["LanguageCode"] = transcription_options.language_code
 
-        print("Transcoding...")
-
         transcribe_job = aws_transcribe_client.start_transcription_job(**job_kwargs)
-    else:
-        print("Adopting existing transcode job...")
 
-
-    transcribe_progress_callback(0.0)
-
-    print("Waiting...")
+    progress_callback("Transcoding Queued", 0.00)
 
     wait_counter = 0
     while transcribe_job['TranscriptionJob']['TranscriptionJobStatus'] in ['QUEUED', 'IN_PROGRESS']:
-        wait_counter += 1
-
-        time.sleep(5)
+        time.sleep(1)
 
         transcribe_job = aws_transcribe_client.get_transcription_job(
             TranscriptionJobName=job_name
         )
 
-        # Make a fake progress counter which asymptotically approaches complete
-        progress = 0.75 - (1.0 / wait_counter)
         if transcribe_job['TranscriptionJob']['TranscriptionJobStatus'] == 'QUEUED':
-            transcribe_progress_callback(progress)
-        elif transcribe_job['TranscriptionJob']['TranscriptionJobStatus'] == 'IN_PROGRESS':
-            transcribe_progress_callback(progress + 0.25)
-        elif transcribe_job['TranscriptionJob']['TranscriptionJobStatus'] == 'COMPLETED':
-            transcribe_progress_callback(1.0)
+            progress_callback("Transcoding Queued", progress)
+        else:
+            # Make a fake progress counter which asymptotically approaches complete
+            wait_counter += 1
+            progress = max(1.0 - (10.0 / wait_counter), 0.05)
+
+            if transcribe_job['TranscriptionJob']['TranscriptionJobStatus'] == 'IN_PROGRESS':
+                progress_callback("Transcoding", progress)
+            elif transcribe_job['TranscriptionJob']['TranscriptionJobStatus'] == 'COMPLETED':
+                progress_callback("Transcoding", 1.0)
 
     if transcribe_job['TranscriptionJob']['TranscriptionJobStatus'] != 'COMPLETED':
+        progress_callback("ERROR", 1.0)
         click.echo("Transcription job failed!\n{}".format(json.dumps(transcribe_job, sort_keys=True, indent=4)), err=True)
         raise "Transcription error"
 
-    print("Downloading...")
+    progress_callback("Downloading", 0.0)
     local_transcript_path = os.path.join(os.path.dirname(input_file), transcript_file_name)
 
     # Parse the given HTTP S3 URI into the correct format for boto to use
@@ -288,6 +335,8 @@ def transcribe(input_file, transcription_options, transcription_config, upload_p
         Key="/".join(result_s3_key_components),
         Filename=local_transcript_path
     )
+
+    progress_callback("Done", 1.0)
 
     return local_transcript_path
 
@@ -358,5 +407,15 @@ def grep(query, inputs, mode, ignore_type, padding, context, s3_bucket, input_pr
 
     transcript_path_by_input_path = ensure_transcripts(input_files, TranscriptionOptions(), TranscriptionConfig("aws_transcribe", s3_bucket, input_prefix, output_prefix))
 
+IS_EXITING = False
+def keyboard_interrupt_handler(signal, frame):
+    global IS_EXITING
+    IS_EXITING = True
+    click.echo('Exiting', err=True)
+    sys.exit(1)
+
 if __name__ == '__main__':
+    # Ensure proper exit when ctrl-c is pressed, even if we're in a thread
+    signal.signal(signal.SIGINT, keyboard_interrupt_handler)
+
     grep()

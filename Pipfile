@@ -9,6 +9,7 @@ verify_ssl = true
 click = "*"
 xxhash = "*"
 boto3 = "*"
+tqdm = "*"
 
 [requires]
 python_version = "3.8"
