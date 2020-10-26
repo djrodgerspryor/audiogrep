@@ -17,6 +17,7 @@ from concurrent.futures import ThreadPoolExecutor
 from tqdm import tqdm
 import math
 import signal
+from transcript_grep import transcript_grep
 
 TranscriptionConfig = collections.namedtuple("TranscriptionConfig", ["provider", "s3_bucket", "input_prefix", "output_prefix"])
 
@@ -149,8 +150,9 @@ def ensure_transcripts(input_files, transcription_options, transcription_config)
 
     to_transcode = [input_file for input_file in input_files if input_file not in transcript_path_by_input_path]
 
-    for input_file, transcript_file in zip(to_transcode, batch_transcribe(to_transcode, transcription_options, transcription_config)):
-        transcript_path_by_input_path[input_file] = transcript_file
+    if len(to_transcode) > 0:
+        for input_file, transcript_file in zip(to_transcode, batch_transcribe(to_transcode, transcription_options, transcription_config)):
+            transcript_path_by_input_path[input_file] = transcript_file
 
     return transcript_path_by_input_path
 
@@ -159,13 +161,11 @@ def batch_transcribe(input_files, transcription_options, transcription_config):
 
     # Parallel
     with ThreadPoolExecutor(max_workers=MAX_PARALLEL_JOBS) as pool:
-        sorted_input_files = sorted(list(input_files))
-
         progress_description_width = 20
         progress_bars_by_input_file = {}
 
         try:
-            for i, input_file in enumerate(sorted_input_files):
+            for i, input_file in enumerate(input_files):
                 progress_bars_by_input_file[input_file] = tqdm(
                     position=i, # This creates different bars which won't overwrite each other
                     leave=False, # Remove progress bars once they're all done
@@ -194,7 +194,7 @@ def batch_transcribe(input_files, transcription_options, transcription_config):
                     transcription_config,
                     progress_callback=lambda state, progress: update_progress(input_file, state, progress)
                 ),
-                sorted_input_files
+                input_files
             )
 
             # Wait for execution to finish
@@ -362,6 +362,48 @@ def upsert_config(new_config):
 
     click.echo("Config saved to ~/.speech-grep", err=True)
 
+def speech_grep(query, inputs, mode, ignore_type, padding, context, s3_bucket, input_prefix, output_prefix, format):
+    # Expand globs and select audio files
+    input_files = sorted(list(select_input_files(inputs, ignore_type)))
+
+    # Transcribe the audio files if needed
+    transcript_path_by_input_path = ensure_transcripts(input_files, TranscriptionOptions(), TranscriptionConfig("aws_transcribe", s3_bucket, input_prefix, output_prefix))
+
+    result_dicts = []
+    for input_file in input_files:
+        transcript_file = transcript_path_by_input_path[input_file]
+
+        # Grep the transcript file
+        matches = transcript_grep(query=query, input=open(transcript_file, 'r'), mode=mode, padding=padding, context=context, format='none')
+
+        # Display the results
+        if len(matches) > 0:
+            if format == 'text':
+                click.echo(click.style(os.path.relpath(input_file), underline=True, dim=True), err=True)
+
+            for match in matches:
+                # Include the file path in the JSON output
+                match['path'] = input_file
+
+                result_dicts.append(match)
+
+                if format == 'text':
+                    click.echo("{:.2f}\t{:.2f}\t{}{}{}".format(
+                        match['start_time'],
+                        match['end_time'],
+                        match['context']['before'],
+                        click.style(match['match'], fg="red", bold=True),
+                        match['context']['after']
+                    ))
+                elif format == 'json':
+                    click.echo(json.dumps(match))
+
+            if format == 'text':
+                # Make a newline before the next block of results
+                click.echo("", err=True)
+
+    return result_dicts
+
 @click.command(help="""
         Search audio transcripts with a grep-like interface. Currently only supports transcripts in the format produced by AWS Transcribe.
 
@@ -396,16 +438,39 @@ def upsert_config(new_config):
 @click.option('--s3-bucket', type=str, default=lambda: os.environ.get('S3_BUCKET', get_saved_config().get('default_s3_bucket', '')), help="S3 bucket to use for AWS transcription")
 @click.option('--input-prefix', type=str, default="transcribe/inputs/", help="S3 prefix to use for uploaded audio files")
 @click.option('--output-prefix', type=str, default="transcribe/outputs/", help="S3 prefix to use for generated transcript files")
-def grep(query, inputs, mode, ignore_type, padding, context, s3_bucket, input_prefix, output_prefix):
-    input_files = select_input_files(inputs, ignore_type)
-
+@click.option(
+    '--format',
+    '-f',
+    type=click.Choice(
+        ['text', 'json'],
+        case_sensitive=False
+    ),
+    default="text",
+    help="Output format for stdout. Use json if you want to automatically parse the results."
+)
+def speech_grep_command(query, inputs, mode, ignore_type, padding, context, s3_bucket, input_prefix, output_prefix, format):
     # Allow callers to specify a working S3 bucket interactively
     if s3_bucket == '':
         s3_bucket = click.prompt('S3 Bucket not specified. Which S3 bucket would you like to use for transcoding?', type=str)
         if click.confirm('Would you like to save this S3 bucket as the default for future use?'):
             upsert_config({ "default_s3_bucket": s3_bucket })
 
-    transcript_path_by_input_path = ensure_transcripts(input_files, TranscriptionOptions(), TranscriptionConfig("aws_transcribe", s3_bucket, input_prefix, output_prefix))
+    results = speech_grep(
+        query=query,
+        inputs=inputs,
+        mode=mode,
+        ignore_type=ignore_type,
+        padding=padding,
+        context=context,
+        s3_bucket=s3_bucket,
+        input_prefix=input_prefix,
+        output_prefix=output_prefix,
+        format=format
+    )
+
+    if len(results) == 0:
+        click.echo(click.style("No match found", fg='red'), err=True)
+        exit(1)
 
 IS_EXITING = False
 def keyboard_interrupt_handler(signal, frame):
@@ -418,4 +483,4 @@ if __name__ == '__main__':
     # Ensure proper exit when ctrl-c is pressed, even if we're in a thread
     signal.signal(signal.SIGINT, keyboard_interrupt_handler)
 
-    grep()
+    speech_grep_command()

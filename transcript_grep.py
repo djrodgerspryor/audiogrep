@@ -164,6 +164,79 @@ class CandidateTranscription:
         # Turn that fraction into a timestamp
         return interval.data['start_time'] + (interpolation_fraction * (interval.data['end_time'] - interval.data['start_time']))
 
+def transcript_grep(query, input, mode, padding, context, format):
+    transcription_data = json.loads(input.read())
+
+    # The items field contains the maximum likelihood transcription value
+    maximum_liklihood_transcription = CandidateTranscription(transcription_data['results']['items'])
+
+    results = []
+    if mode == 'simple':
+        result = maximum_liklihood_transcription.simple_find(query)
+
+        if result is not None:
+            results.append(result)
+
+    elif mode in ['re', 'regexp', 'regex']:
+        for result in maximum_liklihood_transcription.regex_findall(query):
+            results.append(result)
+
+    else:
+        raise "Unknown mode: {}".format(mode)
+
+    if len(results) == 0:
+        return []
+
+    if format != 'none':
+        click.echo(click.style("{} matches found!".format(len(results)), fg='green'), err=True)
+
+    padded_results = [s.pad(padding) for s in results]
+
+    if format == 'text':
+        # Render the heading row
+        click.echo(
+            "\t".join([
+                click.style(heading, underline=True, dim=True)
+                for heading
+                in ("Start", "End", "Text")
+            ]),
+            err=True
+        )
+
+    result_dicts = []
+
+    # And then the actual matches, line-by-line
+    for result in padded_results:
+        before_context, text, after_context = result.text_with_context(context)
+
+        result_dict = {
+            "start_time": result.time_slice.start_time,
+            "end_time": result.time_slice.end_time,
+            "match": text,
+            "context": {
+                "before": before_context,
+                "after": after_context,
+            }
+        }
+        result_dicts.append(result_dict)
+
+        if format == 'text':
+            click.echo("{:.2f}\t{:.2f}\t{}{}{}".format(
+                result.time_slice.start_time,
+                result.time_slice.end_time,
+                before_context,
+                click.style(text, fg="red", bold=True),
+                after_context
+            ))
+        elif format == 'json':
+            click.echo(json.dumps(result_dict))
+        elif format == 'none':
+            pass
+        else:
+            raise "Unknown format: {}".format(format)
+
+    return result_dicts
+
 @click.command(help="""
         Search audio transcripts with a grep-like interface. Currently only supports transcripts in the format produced by AWS Transcribe.
 
@@ -198,75 +271,18 @@ class CandidateTranscription:
     '--format',
     '-f',
     type=click.Choice(
-        ['text', 'json'],
+        ['text', 'json', 'none'],
         case_sensitive=False
     ),
     default="text",
     help="Output format for stdout. Use json if you want to automatically parse the results."
 )
-def grep(query, input, mode, padding, context, format):
-    transcription_data = json.loads(input.read())
-
-    # The items field contains the maximum likelihood transcription value
-    maximum_liklihood_transcription = CandidateTranscription(transcription_data['results']['items'])
-
-    results = []
-    if mode == 'simple':
-        result = maximum_liklihood_transcription.simple_find(query)
-
-        if result is not None:
-            results.append(result)
-
-    elif mode in ['re', 'regexp', 'regex']:
-        for result in maximum_liklihood_transcription.regex_findall(query):
-            results.append(result)
-
-    else:
-        raise "Unknown mode: {}".format(mode)
+def transcript_grep_command(query, input, mode, padding, context, format):
+    results = transcript_grep(query=query, input=input, mode=mode, padding=padding, context=context, format=format)
 
     if len(results) == 0:
         click.echo(click.style("No match found", fg='red'), err=True)
         exit(1)
 
-    click.echo(click.style("{} matches found!".format(len(results)), fg='green'), err=True)
-
-    padded_results = [s.pad(padding) for s in results]
-
-    if format == 'text':
-        # Render the heading row
-        click.echo(
-            "\t".join([
-                click.style(heading, underline=True, dim=True)
-                for heading
-                in ("Start", "End", "Text")
-            ]),
-            err=True
-        )
-
-    # And then the actual matches, line-by-line
-    for result in padded_results:
-        before_context, text, after_context = result.text_with_context(context)
-
-        if format == 'text':
-            click.echo("{:.2f}\t{:.2f}\t{}{}{}".format(
-                result.time_slice.start_time,
-                result.time_slice.end_time,
-                before_context,
-                click.style(text, fg="red", bold=True),
-                after_context
-            ))
-        elif format == 'json':
-            click.echo(json.dumps({
-                "start_time": result.time_slice.start_time,
-                "end_time": result.time_slice.end_time,
-                "match": text,
-                "context": {
-                    "before": before_context,
-                    "after": after_context,
-                }
-            }))
-        else:
-            raise "Unknown format: {}".format(format)
-
 if __name__ == '__main__':
-    grep()
+    transcript_grep_command()

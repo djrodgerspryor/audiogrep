@@ -10,6 +10,8 @@ click = "*"
 xxhash = "*"
 boto3 = "*"
 tqdm = "*"
+regex = "*"
+intervaltree = "*"
 
 [requires]
 python_version = "3.8"
