@@ -165,22 +165,26 @@ def batch_transcribe(input_files, transcription_options, transcription_config):
         progress_bars_by_input_file = {}
 
         try:
-            for i, input_file in enumerate(input_files):
-                progress_bars_by_input_file[input_file] = tqdm(
-                    position=i, # This creates different bars which won't overwrite each other
-                    leave=False, # Remove progress bars once they're all done
-                    total=100,
-                    unit="%",
-                    desc="Queued".rjust(progress_description_width, ' '),
-                    postfix=os.path.basename(input_file)
-                )
-
+            progress_bar_counter = 0
             def update_progress(input_file, state, progress_fraction):
+                nonlocal progress_bar_counter
+
                 # Exit this thread if there's a global exit in progress. This is a convenient
                 # place for cooperative scheduling because it will be called by all threads
                 # frequently
                 if IS_EXITING:
                     raise SystemExit
+
+                if input_file not in progress_bars_by_input_file:
+                    progress_bar_counter += 1
+                    progress_bars_by_input_file[input_file] = tqdm(
+                        position=progress_bar_counter, # This creates different bars which won't overwrite each other
+                        leave=True, # Remove progress bars once they're all done
+                        total=100,
+                        unit="%",
+                        desc="Queued".rjust(progress_description_width, ' '),
+                        postfix=os.path.basename(input_file)
+                    )
 
                 bar = progress_bars_by_input_file[input_file]
                 new_progress_value = max(0, min(100, math.floor(progress_fraction * 100.0)))
