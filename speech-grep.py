@@ -18,6 +18,7 @@ from tqdm import tqdm
 import math
 import signal
 from transcript_grep import transcript_grep
+import threading
 
 TranscriptionConfig = collections.namedtuple("TranscriptionConfig", ["provider", "s3_bucket", "input_prefix", "output_prefix"])
 
@@ -165,6 +166,7 @@ def batch_transcribe(input_files, transcription_options, transcription_config):
         progress_bars_by_input_file = {}
 
         try:
+            progress_lock = threading.Lock()
             progress_bar_counter = 0
             def update_progress(input_file, state, progress_fraction):
                 nonlocal progress_bar_counter
@@ -175,28 +177,38 @@ def batch_transcribe(input_files, transcription_options, transcription_config):
                 if IS_EXITING:
                     raise SystemExit
 
-                if input_file not in progress_bars_by_input_file:
-                    progress_bar_counter += 1
-                    progress_bars_by_input_file[input_file] = tqdm(
-                        position=progress_bar_counter, # This creates different bars which won't overwrite each other
-                        leave=True, # Remove progress bars once they're all done
-                        total=100,
-                        unit="%",
-                        desc="Queued".rjust(progress_description_width, ' '),
-                        postfix=os.path.basename(input_file)
-                    )
+                with progress_lock:
+                    if input_file not in progress_bars_by_input_file:
+                        progress_bar_counter += 1
+                        progress_bars_by_input_file[input_file] = tqdm(
+                            position=progress_bar_counter, # This creates different bars which won't overwrite each other
+                            leave=True, # Remove progress bars once they're all done
+                            total=100,
+                            unit="%",
+                            desc="Queued".rjust(progress_description_width, ' '),
+                            postfix=os.path.basename(input_file)
+                        )
 
-                bar = progress_bars_by_input_file[input_file]
-                new_progress_value = max(0, min(100, math.floor(progress_fraction * 100.0)))
-                bar.update(new_progress_value - bar.n) # Pass in a diff value
-                bar.set_description(state.rjust(progress_description_width, ' '))
+                    bar = progress_bars_by_input_file[input_file]
+                    new_progress_value = max(0, min(100, math.floor(progress_fraction * 100.0)))
+                    bar.update(new_progress_value - bar.n) # Pass in a diff value
+                    bar.set_description(state.rjust(progress_description_width, ' '))
+
+            aws_s3_client = boto3.client('s3')
+            aws_transcribe_client = boto3.client('transcribe')
 
             results = pool.map(
                 lambda input_file: transcribe(
+                    aws_s3_client,
+                    aws_transcribe_client,
                     input_file,
                     transcription_options,
                     transcription_config,
-                    progress_callback=lambda state, progress: update_progress(input_file, state, progress)
+                    progress_callback=lambda state, progress: update_progress(
+                        input_file,
+                        state,
+                        progress
+                    )
                 ),
                 input_files
             )
@@ -205,8 +217,9 @@ def batch_transcribe(input_files, transcription_options, transcription_config):
             results = list(results)
 
         finally:
-            # Clean-up all progress bars once we're done
-            for bar in progress_bars_by_input_file.values():
+            # Clean-up all progress bars once we're done.
+            # Adding list() takes a copy to stop errors due to another thread mutating the dict
+            for bar in list(progress_bars_by_input_file.values()):
                 bar.close()
 
     return results
@@ -215,10 +228,7 @@ def batch_transcribe(input_files, transcription_options, transcription_config):
 class ExistingS3ObjectInvalid(Exception):
     pass
 
-def transcribe(input_file, transcription_options, transcription_config, progress_callback=lambda state, progress: None):
-    aws_s3_client = boto3.client('s3')
-    aws_transcribe_client = boto3.client('transcribe')
-
+def transcribe(aws_s3_client, aws_transcribe_client, input_file, transcription_options, transcription_config, progress_callback=lambda state, progress: None):
     progress_callback("Checking S3", 0.00)
 
     file_size = os.path.getsize(input_file)
@@ -306,18 +316,30 @@ def transcribe(input_file, transcription_options, transcription_config, progress
 
     wait_counter = 0
     while transcribe_job['TranscriptionJob']['TranscriptionJobStatus'] in ['QUEUED', 'IN_PROGRESS']:
-        time.sleep(1)
+        time.sleep(3)
 
-        transcribe_job = aws_transcribe_client.get_transcription_job(
-            TranscriptionJobName=job_name
-        )
+        # Handle throttling errors by backing off more
+        while True:
+            try:
+                transcribe_job = aws_transcribe_client.get_transcription_job(
+                    TranscriptionJobName=job_name
+                )
+            except BotoClientError as e:
+                # Re-raise all non-throttling exceptions
+                if exception_obj.response['Error']['Code'] != 'ThrottlingException':
+                    raise
+
+                # Wait longer and retry
+                sleep(30)
+                continue
+            break
 
         if transcribe_job['TranscriptionJob']['TranscriptionJobStatus'] == 'QUEUED':
             progress_callback("Transcoding Queued", progress)
         else:
             # Make a fake progress counter which asymptotically approaches complete
             wait_counter += 1
-            progress = max(1.0 - (10.0 / wait_counter), 0.05)
+            progress = max(1.0 - (3.0 / wait_counter), 0.05)
 
             if transcribe_job['TranscriptionJob']['TranscriptionJobStatus'] == 'IN_PROGRESS':
                 progress_callback("Transcoding", progress)
@@ -366,12 +388,12 @@ def upsert_config(new_config):
 
     click.echo("Config saved to ~/.speech-grep", err=True)
 
-def speech_grep(query, inputs, mode, ignore_type, padding, context, s3_bucket, input_prefix, output_prefix, format):
+def speech_grep(query, inputs, mode, ignore_type, padding, context, s3_bucket, input_prefix, output_prefix, max_alternatives, force_language, format):
     # Expand globs and select audio files
     input_files = sorted(list(select_input_files(inputs, ignore_type)))
 
     # Transcribe the audio files if needed
-    transcript_path_by_input_path = ensure_transcripts(input_files, TranscriptionOptions(), TranscriptionConfig("aws_transcribe", s3_bucket, input_prefix, output_prefix))
+    transcript_path_by_input_path = ensure_transcripts(input_files, TranscriptionOptions(max_alternatives=max_alternatives, language_code=force_language), TranscriptionConfig("aws_transcribe", s3_bucket, input_prefix, output_prefix))
 
     result_dicts = []
     for input_file in input_files:
@@ -442,6 +464,8 @@ def speech_grep(query, inputs, mode, ignore_type, padding, context, s3_bucket, i
 @click.option('--s3-bucket', type=str, default=lambda: os.environ.get('S3_BUCKET', get_saved_config().get('default_s3_bucket', '')), help="S3 bucket to use for AWS transcription")
 @click.option('--input-prefix', type=str, default="transcribe/inputs/", help="S3 prefix to use for uploaded audio files")
 @click.option('--output-prefix', type=str, default="transcribe/outputs/", help="S3 prefix to use for generated transcript files")
+@click.option('--max-alternatives', type=int, default=3, help="Alternative transcriptions to generate (for so that all versions can be searched)")
+@click.option('--force-language', type=str, default=None, help="Optionally tell AWS Transcribe what language to use. Language will be auto-detected if this isn't supplied. Language codes look like 'en-AU' or 'fr-FR' — see AWS docs for the full list.")
 @click.option(
     '--format',
     '-f',
@@ -452,7 +476,7 @@ def speech_grep(query, inputs, mode, ignore_type, padding, context, s3_bucket, i
     default="text",
     help="Output format for stdout. Use json if you want to automatically parse the results."
 )
-def speech_grep_command(query, inputs, mode, ignore_type, padding, context, s3_bucket, input_prefix, output_prefix, format):
+def speech_grep_command(query, inputs, mode, ignore_type, padding, context, s3_bucket, input_prefix, output_prefix, max_alternatives, force_language, format):
     # Allow callers to specify a working S3 bucket interactively
     if s3_bucket == '':
         s3_bucket = click.prompt('S3 Bucket not specified. Which S3 bucket would you like to use for transcoding?', type=str)
@@ -469,6 +493,8 @@ def speech_grep_command(query, inputs, mode, ignore_type, padding, context, s3_b
         s3_bucket=s3_bucket,
         input_prefix=input_prefix,
         output_prefix=output_prefix,
+        max_alternatives=max_alternatives,
+        force_language=force_language,
         format=format
     )
 
