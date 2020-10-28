@@ -12,6 +12,7 @@ boto3 = "*"
 tqdm = "*"
 regex = "*"
 intervaltree = "*"
+pydub = "*"
 
 [requires]
 python_version = "3.8"

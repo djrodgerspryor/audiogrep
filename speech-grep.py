@@ -19,6 +19,7 @@ import math
 import signal
 from transcript_grep import transcript_grep
 import threading
+from pydub import AudioSegment
 
 TranscriptionConfig = collections.namedtuple("TranscriptionConfig", ["provider", "s3_bucket", "input_prefix", "output_prefix"])
 
@@ -28,16 +29,16 @@ SAVED_CONFIG_LOCATION = os.path.expanduser('~/.speech-grep')
 # in AWS Transcribe
 MAX_PARALLEL_JOBS = 20
 
-SUPPORTED_FORMATS = set([
-    'audio/mpeg',
-    'audio/mp4a-latm',
-    'audio/mp4',
-    'audio/mp4a-latm',
-    'audio/ogg',
-    'audio/webm',
-    'audio/x-flac',
-    'audio/x-wav',
-])
+FFMPG_FORMAT_BY_SUPPORTED_FORMATS = {
+    'audio/mpeg': 'mp3',
+    'audio/mp4a-latm': 'mp4',
+    'audio/mp4': 'mp4',
+    'audio/mp4a-latm': 'mp4',
+    'audio/ogg': "ogg",
+    'audio/webm': "webm",
+    'audio/x-flac': "flac",
+    'audio/x-wav': "wav",
+}
 
 class TranscriptionOptions:
     # TODO: maybe support vocabularies etc.
@@ -91,7 +92,7 @@ def select_input_files(inputs, ignore_type):
         for candidate_file in candidate_files:
             mime_type, mime_encoding = mimetypes.guess_type(candidate_file)
 
-            if mime_type.lower() in SUPPORTED_FORMATS:
+            if mime_type.lower() in FFMPG_FORMAT_BY_SUPPORTED_FORMATS:
                 input_files.add(candidate_file)
 
     return input_files
@@ -430,6 +431,24 @@ def speech_grep(query, inputs, mode, ignore_type, padding, context, s3_bucket, i
 
     return result_dicts
 
+AUDIO_SEGMENT_CACHE = {}
+def get_cached_audio_segment(audio_file_path):
+    if audio_file_path not in AUDIO_SEGMENT_CACHE:
+        mime_type, mime_encoding = mimetypes.guess_type(audio_file_path)
+        file_format = FFMPG_FORMAT_BY_SUPPORTED_FORMATS[mime_type]
+        AUDIO_SEGMENT_CACHE[audio_file_path] = (AudioSegment.from_file(audio_file_path, format=file_format), file_format)
+
+    return AUDIO_SEGMENT_CACHE[audio_file_path]
+
+def extract_audio(audio_file_path, start_time, end_time, output_path):
+    click.echo("Saving matched audio to {}".format(output_path))
+    audio_segment, file_format = get_cached_audio_segment(audio_file_path)
+    sliced_audio = audio_segment[round(start_time * 1000):round(end_time * 1000)]
+
+    # Dump the output
+    sliced_audio.export(output_path, format=file_format)
+
+
 @click.command(help="""
         Search audio transcripts with a grep-like interface. Currently only supports transcripts in the format produced by AWS Transcribe.
 
@@ -466,6 +485,7 @@ def speech_grep(query, inputs, mode, ignore_type, padding, context, s3_bucket, i
 @click.option('--output-prefix', type=str, default="transcribe/outputs/", help="S3 prefix to use for generated transcript files")
 @click.option('--max-alternatives', type=int, default=3, help="Alternative transcriptions to generate (for so that all versions can be searched)")
 @click.option('--force-language', type=str, default=None, help="Optionally tell AWS Transcribe what language to use. Language will be auto-detected if this isn't supplied. Language codes look like 'en-AU' or 'fr-FR' — see AWS docs for the full list.")
+@click.option('--export-to', type=str, default=None, help="Chop up the source files to match the grep results and export the resulting audio files to this directory.")
 @click.option(
     '--format',
     '-f',
@@ -476,12 +496,17 @@ def speech_grep(query, inputs, mode, ignore_type, padding, context, s3_bucket, i
     default="text",
     help="Output format for stdout. Use json if you want to automatically parse the results."
 )
-def speech_grep_command(query, inputs, mode, ignore_type, padding, context, s3_bucket, input_prefix, output_prefix, max_alternatives, force_language, format):
+def speech_grep_command(query, inputs, mode, ignore_type, padding, context, s3_bucket, input_prefix, output_prefix, max_alternatives, force_language, export_to, format):
     # Allow callers to specify a working S3 bucket interactively
     if s3_bucket == '':
         s3_bucket = click.prompt('S3 Bucket not specified. Which S3 bucket would you like to use for transcoding?', type=str)
         if click.confirm('Would you like to save this S3 bucket as the default for future use?'):
             upsert_config({ "default_s3_bucket": s3_bucket })
+
+    # Validate export directory
+    if export_to is not None:
+        if not os.path.isdir(export_to):
+            raise "--export-to must be a directory. Got: {}".format(export_to)
 
     results = speech_grep(
         query=query,
@@ -501,6 +526,18 @@ def speech_grep_command(query, inputs, mode, ignore_type, padding, context, s3_b
     if len(results) == 0:
         click.echo(click.style("No match found", fg='red'), err=True)
         exit(1)
+
+    if export_to is not None:
+        for i, result in enumerate(results):
+            extract_audio(
+                audio_file_path=result['path'],
+                start_time=result['start_time'],
+                end_time=result['end_time'],
+                output_path=os.path.join(
+                    export_to,
+                    "{}-{}".format(i, os.path.basename(result['path']))
+                )
+            )
 
 IS_EXITING = False
 def keyboard_interrupt_handler(signal, frame):
