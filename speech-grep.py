@@ -143,13 +143,16 @@ def ensure_transcripts(input_files, transcription_options, transcription_config)
     options_digest = transcription_options.digest()
 
     # This might take a little time to read and hash all of the audio content, so
-    # display a progress bar
-    with click.progressbar(input_files, label="Checking for existing transcripts", file=sys.stderr) as input_files_to_check:
-        for input_file in input_files_to_check:
-            maybe_path = get_existing_transcript(input_file, options_digest)
+    # display a progress bar, and use multiple processes to hash all of the files
+    with ProcessPoolExecutor() as pool:
+        existing_transcripts = pool.map(partial(get_existing_transcript, transcript_query_hash=options_digest), input_files)
+        with click.progressbar(length=len(input_files), label="Checking for existing transcripts", file=sys.stderr) as progressbar:
+            for input_file, maybe_path in zip(input_files, existing_transcripts):
+                if maybe_path is not None:
+                    transcript_path_by_input_path[input_file] = maybe_path
 
-            if maybe_path is not None:
-                transcript_path_by_input_path[input_file] = maybe_path
+                # Increment the progress bar by 1 file
+                progressbar.update(1)
 
     to_transcode = [input_file for input_file in input_files if input_file not in transcript_path_by_input_path]
 
