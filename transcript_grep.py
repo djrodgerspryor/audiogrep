@@ -2,7 +2,7 @@
 
 import click
 import json
-from intervaltree import IntervalTree
+from quicksect import IntervalTree, Interval
 import math
 import regex
 import collections
@@ -54,6 +54,7 @@ class CandidateTranscription:
         chunks = []
         total_length_so_far = 0
         total_log_probability = 0
+        latest_time_so_far = None
         for item in transcription_items:
             # Ignore punctuation
             if item['type'] == 'punctuation':
@@ -68,23 +69,24 @@ class CandidateTranscription:
             end_time = float(item['end_time'])
 
             # Account for the space which will be added
-            if total_length_so_far != 0:
+            if latest_time_so_far is not None:
                 # Insert an interval to account for the space
-                self.tree.addi(
+                self.tree.add(
                     total_length_so_far,
                     total_length_so_far + 1,
                     {
-                        'start_time': self.tree[self.tree.end() - 1].pop().data['end_time'],
+                        'start_time': latest_time_so_far,
                         'end_time': start_time,
                     }
                 )
+                latest_time_so_far = start_time
                 total_length_so_far += 1
 
             beginning_chunk_index = total_length_so_far
             total_length_so_far += len(chunk)
 
             # Add this interval to the tree, mapping the character index interval to the time interval
-            self.tree.addi(
+            self.tree.add(
                 beginning_chunk_index,
                 total_length_so_far,
                 {
@@ -92,6 +94,7 @@ class CandidateTranscription:
                     'end_time': end_time,
                 }
             )
+            latest_time_so_far = end_time
 
             # Record the chunk so that we can build up the transcript as a single string
             chunks.append(chunk)
@@ -100,6 +103,9 @@ class CandidateTranscription:
             confidence = float(alternative['confidence'])
             if confidence > 0:
                 total_log_probability += math.log(confidence)
+
+        # The tree is immutable from this point, so cache its rightmost end
+        self.tree_end_index = total_length_so_far
 
         # Build the transcript string for text searching
         self.transcript_string = " ".join(chunks)
@@ -150,16 +156,16 @@ class CandidateTranscription:
     # Look up an index in the transcript string and turn it into an audio time-stamp
     def find_timestamp(self, transcript_character_index):
         # If this is the last character in the tree
-        if transcript_character_index >= self.tree.end():
+        if transcript_character_index >= self.tree_end_index:
             # Special case handling: pick the last interval and interpolate to the end
-            interval = self.tree[self.tree.end() - 1].pop()
+            interval = self.tree.search(self.tree_end_index - 1, self.tree_end_index)[-1]
             interpolation_fraction = 1.0
         else:
             # Lookup the matching interval
-            interval = self.tree[transcript_character_index].pop()
+            interval = self.tree.search(transcript_character_index, transcript_character_index)[-1]
 
             # Work out how far through this chunk the index is
-            interpolation_fraction = float(transcript_character_index - interval.begin) / float(interval.end - interval.begin)
+            interpolation_fraction = float(transcript_character_index - interval.start) / float(interval.end - interval.start)
 
         # Turn that fraction into a timestamp
         return interval.data['start_time'] + (interpolation_fraction * (interval.data['end_time'] - interval.data['start_time']))
