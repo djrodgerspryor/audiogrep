@@ -13,13 +13,14 @@ import collections
 import json
 import time
 from urllib.parse import urlparse
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 from tqdm import tqdm
 import math
 import signal
 from transcript_grep import transcript_grep
 import threading
 from pydub import AudioSegment
+from functools import partial
 
 TranscriptionConfig = collections.namedtuple("TranscriptionConfig", ["provider", "s3_bucket", "input_prefix", "output_prefix"])
 
@@ -389,6 +390,20 @@ def upsert_config(new_config):
 
     click.echo("Config saved to ~/.speech-grep", err=True)
 
+# Exists because python can't pickle lambdas for silly reasons
+def _grep_input_file_worker(input_file, transcript_path_by_input_path, query, mode, padding, context):
+    return (
+        input_file,
+        transcript_grep(
+            query=query,
+            input=open(transcript_path_by_input_path[input_file], 'r'),
+            mode=mode,
+            padding=padding,
+            context=context,
+            format='none'
+        )
+    )
+
 def speech_grep(query, inputs, mode, ignore_type, padding, context, s3_bucket, input_prefix, output_prefix, max_alternatives, force_language, format):
     # Expand globs and select audio files
     input_files = sorted(list(select_input_files(inputs, ignore_type)))
@@ -396,38 +411,46 @@ def speech_grep(query, inputs, mode, ignore_type, padding, context, s3_bucket, i
     # Transcribe the audio files if needed
     transcript_path_by_input_path = ensure_transcripts(input_files, TranscriptionOptions(max_alternatives=max_alternatives, language_code=force_language), TranscriptionConfig("aws_transcribe", s3_bucket, input_prefix, output_prefix))
 
-    result_dicts = []
-    for input_file in input_files:
-        transcript_file = transcript_path_by_input_path[input_file]
+    with ProcessPoolExecutor() as pool:
+        grep_results = pool.map(
+            partial(
+                _grep_input_file_worker,
+                transcript_path_by_input_path=transcript_path_by_input_path,
+                query=query,
+                mode=mode,
+                padding=padding,
+                context=context
+            ),
+            input_files
+        )
 
-        # Grep the transcript file
-        matches = transcript_grep(query=query, input=open(transcript_file, 'r'), mode=mode, padding=padding, context=context, format='none')
+        result_dicts = []
+        for input_file, matches in grep_results:
+            # Display the results
+            if len(matches) > 0:
+                if format == 'text':
+                    click.echo(click.style(os.path.relpath(input_file), underline=True, dim=True), err=True)
 
-        # Display the results
-        if len(matches) > 0:
-            if format == 'text':
-                click.echo(click.style(os.path.relpath(input_file), underline=True, dim=True), err=True)
+                for match in matches:
+                    # Include the file path in the JSON output
+                    match['path'] = input_file
 
-            for match in matches:
-                # Include the file path in the JSON output
-                match['path'] = input_file
+                    result_dicts.append(match)
 
-                result_dicts.append(match)
+                    if format == 'text':
+                        click.echo("{:.2f}\t{:.2f}\t{}{}{}".format(
+                            match['start_time'],
+                            match['end_time'],
+                            match['context']['before'],
+                            click.style(match['match'], fg="red", bold=True),
+                            match['context']['after']
+                        ))
+                    elif format == 'json':
+                        click.echo(json.dumps(match))
 
                 if format == 'text':
-                    click.echo("{:.2f}\t{:.2f}\t{}{}{}".format(
-                        match['start_time'],
-                        match['end_time'],
-                        match['context']['before'],
-                        click.style(match['match'], fg="red", bold=True),
-                        match['context']['after']
-                    ))
-                elif format == 'json':
-                    click.echo(json.dumps(match))
-
-            if format == 'text':
-                # Make a newline before the next block of results
-                click.echo("", err=True)
+                    # Make a newline before the next block of results
+                    click.echo("", err=True)
 
     return result_dicts
 
